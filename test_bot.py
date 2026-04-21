@@ -167,19 +167,19 @@ async def test_clob_auth():
         chain_id = AMOY if USE_TESTNET else POLYGON
         
         api_creds = {
-            "key": os.getenv("POLY_BUILDER_API_KEY"),
-            "secret": os.getenv("POLY_BUILDER_SECRET"),
-            "passphrase": os.getenv("POLY_BUILDER_PASSPHRASE"),
-        }
-        
-        client = ClobClient(
-            host,
-            key=os.getenv("POLY_PRIVATE_KEY"),
-            chain_id=chain_id,
-            signature_type=1,
-            funder=os.getenv("POLY_FUNDER_ADDRESS"),
-            creds=api_creds
-        )
+    "key": os.getenv("POLY_BUILDER_API_KEY"),
+    "secret": os.getenv("POLY_BUILDER_SECRET"),
+    "passphrase": os.getenv("POLY_BUILDER_PASSPHRASE"),
+}
+
+client = ClobClient(
+    host,
+    key=os.getenv("POLY_PRIVATE_KEY"),
+    chain_id=chain_id,
+    signature_type=1,
+    funder=os.getenv("POLY_FUNDER_ADDRESS"),
+    creds=api_creds
+)
         
         print_test("CLOB Client Init", True, f"Connected to {'TESTNET' if USE_TESTNET else 'MAINNET'}")
         
