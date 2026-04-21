@@ -10,6 +10,7 @@ import sys
 import asyncio
 import aiohttp
 import json
+import ssl
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -69,7 +70,7 @@ def test_environment():
             all_passed = False
     
     # Optional variables
-    trade_size = os.getenv("TRADE_SIZE", "1.0")
+    trade_size = os.getenv("TRADE_SIZE", "5.0")
     conf_threshold = os.getenv("CONFIDENCE_THRESHOLD", "0.65")
     
     print_test("TRADE_SIZE", True, f"Value: {trade_size}")
@@ -85,12 +86,18 @@ async def test_connectivity():
     """Test connections to Binance and Polymarket APIs"""
     print_section("TEST 2: NETWORK CONNECTIVITY")
     
+    # Create SSL context that ignores certificate errors (for Termux testing)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
     # Test Binance
     print("\n📡 Testing Binance API...")
     binance_ok = False
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
         try:
-            async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5) as resp:
+            async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     price = float(data["price"])
@@ -104,10 +111,10 @@ async def test_connectivity():
     # Test Polymarket Gamma API
     print("\n📡 Testing Polymarket Gamma API...")
     gamma_ok = False
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
         try:
             # Get current time for a real market slug
-            now = datetime.utcnow()
+            now = datetime.now(datetime.UTC)
             minute = now.minute
             window_minute = (minute // 5) * 5
             window_start = now.replace(minute=window_minute, second=0, microsecond=0)
@@ -115,7 +122,7 @@ async def test_connectivity():
             slug = f"btc-updown-5m-{window_ts}"
             
             url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
-            async with session.get(url, timeout=10) as resp:
+            async with session.get(url, timeout=15) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     token_ids = data.get("clobTokenIds", [])
@@ -135,9 +142,9 @@ async def test_connectivity():
     print("\n📡 Testing Polymarket CLOB API...")
     clob_ok = False
     host = "https://clob-staging.polymarket.com" if USE_TESTNET else "https://clob.polymarket.com"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
         try:
-            async with session.get(f"{host}/book?token_id=0x123", timeout=5) as resp:
+            async with session.get(f"{host}/book?token_id=0x123", timeout=10) as resp:
                 # Expect 400 or 404, but connection should work
                 clob_ok = resp.status in [200, 400, 404]
                 print_test("CLOB API", clob_ok, f"Connected to {host} (HTTP {resp.status})")
@@ -166,27 +173,26 @@ async def test_clob_auth():
         host = "https://clob-staging.polymarket.com" if USE_TESTNET else "https://clob.polymarket.com"
         chain_id = AMOY if USE_TESTNET else POLYGON
         
-        api_creds = {
-    "key": os.getenv("POLY_BUILDER_API_KEY"),
-    "secret": os.getenv("POLY_BUILDER_SECRET"),
-    "passphrase": os.getenv("POLY_BUILDER_PASSPHRASE"),
-}
-
-client = ClobClient(
-    host,
-    key=os.getenv("POLY_PRIVATE_KEY"),
-    chain_id=chain_id,
-    signature_type=1,
-    funder=os.getenv("POLY_FUNDER_ADDRESS"),
-    creds=api_creds
-)
+        client = ClobClient(
+            host,
+            key=os.getenv("POLY_PRIVATE_KEY"),
+            chain_id=chain_id,
+            signature_type=1,
+            funder=os.getenv("POLY_FUNDER_ADDRESS"),
+            api_key=os.getenv("POLY_BUILDER_API_KEY"),
+            api_secret=os.getenv("POLY_BUILDER_SECRET"),
+            api_passphrase=os.getenv("POLY_BUILDER_PASSPHRASE")
+        )
         
         print_test("CLOB Client Init", True, f"Connected to {'TESTNET' if USE_TESTNET else 'MAINNET'}")
         
         # Test getting server time (doesn't require auth)
         loop = asyncio.get_running_loop()
-        server_time = await loop.run_in_executor(None, client.get_server_time)
-        print_test("Server Time", True, f"Server timestamp: {server_time}")
+        try:
+            server_time = await loop.run_in_executor(None, client.get_server_time)
+            print_test("Server Time", True, f"Server timestamp: {server_time}")
+        except Exception as e:
+            print_test("Server Time", False, f"Error: {str(e)[:50]}")
         
         # Test getting balance (requires auth)
         try:
@@ -292,12 +298,17 @@ async def test_price_fetching():
     """Test BTC price fetching functions"""
     print_section("TEST 5: BTC PRICE FETCHING")
     
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
     async def get_btc_price_now():
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             try:
                 async with session.get(
                     "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-                    timeout=5
+                    timeout=10
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -309,9 +320,9 @@ async def test_price_fetching():
     async def get_btc_price_at_timestamp(timestamp_sec):
         minute_start = timestamp_sec - (timestamp_sec % 60)
         url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={minute_start*1000}&limit=1"
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=connector) as session:
             try:
-                async with session.get(url, timeout=10) as resp:
+                async with session.get(url, timeout=15) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data and len(data) > 0:
@@ -329,7 +340,7 @@ async def test_price_fetching():
         return False
     
     # Test historical price (5 minutes ago)
-    past_ts = int(datetime.utcnow().timestamp()) - 300
+    past_ts = int(datetime.now(datetime.UTC).timestamp()) - 300
     historical = await get_btc_price_at_timestamp(past_ts)
     if historical:
         print_test("Historical BTC Price", True, f"5 min ago: ${historical:,.2f}")
@@ -352,6 +363,8 @@ def test_order_validation():
     MIN_LIMIT_SHARES = 5.0
     MIN_MARKET_NOTIONAL = 1.00
     
+    import math
+    
     test_cases = [
         # (order_type, input_size, estimated_price, expected_size)
         ("LIMIT", 1.0, 0.55, 5.0),
@@ -361,8 +374,6 @@ def test_order_validation():
         ("MARKET", 5.0, 0.55, 5.0),   # $2.75 >= $1.00 → keep 5
         ("MARKET", 1.0, 0.30, 4.0),   # $0.30 < $1.00 → need 4 shares ($1.20)
     ]
-    
-    import math
     
     all_passed = True
     for order_type, input_size, est_price, expected in test_cases:
@@ -391,8 +402,6 @@ def test_order_validation():
 def test_window_timing():
     """Test 5-minute window calculation"""
     print_section("TEST 7: WINDOW TIMING LOGIC")
-    
-    from datetime import datetime, timedelta
     
     test_times = [
         datetime(2024, 1, 15, 10, 13, 30),  # Should floor to 10:10
@@ -500,19 +509,22 @@ async def quick_check():
     
     # Check internet
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/ping", timeout=3) as resp:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get("https://api.binance.com/api/v3/ping", timeout=5) as resp:
                 if resp.status == 200:
                     print("✅ Internet connection OK")
                 else:
                     print("❌ Internet connection issue")
                     return False
-    except:
-        print("❌ Cannot reach internet")
+    except Exception as e:
+        print(f"❌ Cannot reach internet: {e}")
         return False
     
     # Check Python version
-    import sys
     if sys.version_info >= (3, 9):
         print(f"✅ Python {sys.version_info.major}.{sys.version_info.minor}")
     else:
@@ -524,7 +536,6 @@ async def quick_check():
 
 if __name__ == "__main__":
     import sys
-    
     if len(sys.argv) > 1 and sys.argv[1] == "--quick":
         asyncio.run(quick_check())
     else:
