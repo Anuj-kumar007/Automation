@@ -36,7 +36,7 @@ load_dotenv()
 # ============================================================
 USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "5.0"))
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.65"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.50"))
 ORDER_TYPE = os.getenv("ORDER_TYPE", "MARKET").upper()
 
 if USE_TESTNET:
