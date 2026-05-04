@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi‑Limit Bot – 4 limits (0.35 … 0.20) + live ticker + BTC updater + health endpoint
-Render‑ready with fallback slug and threaded dashboard.
+Multi‑Limit Bot – 4 limits (0.35 … 0.20) + live ticker + BTC updater
+Render‑ready: fixed slug fallback, dual BTC source, health endpoint.
 """
 import os, sys, time, json, asyncio, threading, socketserver, requests
 from datetime import datetime, timezone, timedelta
@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import aiohttp
 
 # -------------------------------------------------------------------
-# CONFIG – only 4 limits now
+# CONFIG
 # -------------------------------------------------------------------
 SIM_STARTING_BALANCE = 100.0
 SHARES_PER_SIDE = 5
@@ -19,7 +19,7 @@ WEB_PORT = int(os.environ.get("PORT", 10003))
 SCAN_INTERVAL = 0.2
 PUBLIC_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Health tracking
+# Health status
 loop_status = {
     "running": False,
     "last_window": None,
@@ -71,18 +71,41 @@ def get_bid_ask(up_token, down_token):
         down_ask = down_ask or da
     return {"UP": {"bid": up_bid, "ask": up_ask}, "DOWN": {"bid": down_bid, "ask": down_ask}}
 
-async def get_current_slug():
+# -------------------------------------------------------------------
+# Slug helpers – now they try three windows: current, previous, next
+# -------------------------------------------------------------------
+def get_slug_for_timestamp(ts: int) -> str:
+    """Return slug for a given UTC timestamp (seconds), floored to 5-min boundary."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    wmin = (dt.minute // 5) * 5
+    ws = dt.replace(minute=wmin, second=0, microsecond=0)
+    return f"btc-updown-5m-{int(ws.timestamp())}"
+
+async def get_token_ids_robust():
+    """Try current window slug, then previous, then next (some markets appear late)."""
     now = datetime.now(timezone.utc)
+    # current 5-min floor
     wmin = (now.minute // 5) * 5
     ws = now.replace(minute=wmin, second=0, microsecond=0)
-    return f"btc-updown-5m-{int(ws.timestamp())}"
+    slugs_to_try = [
+        f"btc-updown-5m-{int(ws.timestamp())}",               # current
+        f"btc-updown-5m-{int((ws - timedelta(minutes=5)).timestamp())}",  # previous
+        f"btc-updown-5m-{int((ws + timedelta(minutes=5)).timestamp())}",  # next (in case market created ahead)
+    ]
+    for slug in slugs_to_try:
+        print(f"🔍 Trying slug: {slug}")
+        token_up, token_down = await get_token_ids(slug)
+        if token_up and token_down:
+            print(f"✅ Found tokens for {slug}")
+            return token_up, token_down, slug
+        await asyncio.sleep(0.2)
+    return None, None, None
 
 async def get_token_ids(slug):
     url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
     async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
         try:
             async with sess.get(url, timeout=10) as resp:
-                print(f"🔎 Token lookup {url} -> {resp.status}")
                 if resp.status == 200:
                     data = await resp.json()
                     raw = data.get("clobTokenIds")
@@ -172,17 +195,51 @@ class SimAccount:
 
 accounts = {f"${limit:.2f}": SimAccount(f"${limit:.2f}", SIM_STARTING_BALANCE) for limit in LIMIT_PRICES}
 
-async def btc_price_updater():
+# -------------------------------------------------------------------
+# BTC price updater – dual source (Binance + CoinGecko fallback)
+# -------------------------------------------------------------------
+async def get_btc_price():
+    """Return BTC price from Binance, or CoinGecko as backup."""
     async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
-        while True:
-            try:
-                async with sess.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3) as resp:
-                    if resp.status == 200:
-                        price = float((await resp.json())["price"])
-                        market_data.update_btc(price)
-            except Exception as e:
-                print(f"⚠️ BTC price error: {e}")
-            await asyncio.sleep(1)
+        try:
+            async with sess.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3) as resp:
+                if resp.status == 200:
+                    return float((await resp.json())["price"])
+        except:
+            pass
+        try:
+            async with sess.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=3) as resp:
+                if resp.status == 200:
+                    return float((await resp.json())["bitcoin"]["usd"])
+        except:
+            pass
+    return None
+
+async def btc_price_updater():
+    while True:
+        price = await get_btc_price()
+        if price:
+            market_data.update_btc(price)
+        await asyncio.sleep(1)
+
+# -------------------------------------------------------------------
+# Beat price fetcher – same dual source, for the window start
+# -------------------------------------------------------------------
+async def get_beat_price(wts):
+    """Get BTC open price just before the window start."""
+    # First try Binance klines
+    async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
+        try:
+            url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={(wts-60)*1000}&limit=1"
+            async with sess.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data:
+                        return float(data[0][1])   # open price
+        except:
+            pass
+    # Fallback to current price
+    return await get_btc_price()
 
 async def market_monitor(up_token, down_token, beat_price, stop_event, fill_events):
     while not stop_event.is_set():
@@ -446,7 +503,7 @@ def run_web_server():
 # -------------------------------------------------------------------
 async def main():
     print("=" * 60)
-    print("Multi‑Limit Bot – 4 limits, Render ready")
+    print("Multi‑Limit Bot – 4 limits, Render ready (fixed)")
     asyncio.create_task(btc_price_updater())
     threading.Thread(target=run_web_server, daemon=True).start()
 
@@ -454,61 +511,48 @@ async def main():
 
     while True:
         try:
-            slug = await get_current_slug()
-            print(f"🔍 Slug: {slug}")
-            token_up, token_down = await get_token_ids(slug)
-
-            # fallback to previous 5-min window if current not yet available
-            if not token_up or not token_down:
-                now = datetime.now(timezone.utc)
-                wmin_prev = ((now.minute // 5) * 5) - 5
-                ws_prev = now.replace(minute=wmin_prev % 60, second=0, microsecond=0)
-                slug_prev = f"btc-updown-5m-{int(ws_prev.timestamp())}"
-                print(f"⚠️ No tokens for {slug}, trying {slug_prev}")
-                token_up, token_down = await get_token_ids(slug_prev)
-
+            # Get tokens (robust three-window search)
+            token_up, token_down, used_slug = await get_token_ids_robust()
             if not token_up or not token_down:
                 loop_status["last_error"] = "no_token_ids"
-                print("❌ No token IDs – retrying in 10s")
+                print("❌ No market found for any nearby window – retrying in 10s")
                 await asyncio.sleep(10)
                 continue
 
-            now = datetime.now(timezone.utc)
-            wmin = (now.minute // 5) * 5
-            ws = now.replace(minute=wmin, second=0, microsecond=0)
+            # Determine window start from the used slug
+            # slug format "btc-updown-5m-<timestamp>"
+            wts = int(used_slug.split("-")[-1])
+            ws = datetime.fromtimestamp(wts, tz=timezone.utc)
             we = ws + timedelta(minutes=5)
-            wts = int(ws.timestamp())
+
+            # Wait until window start if we're early
             if time.time() < wts:
-                await asyncio.sleep(wts - time.time() + 0.5)
+                wait = wts - time.time() + 0.5
+                print(f"⏳ Waiting {wait:.1f}s for window start...")
+                await asyncio.sleep(wait)
 
             loop_status["last_window"] = ws.strftime("%H:%M:%S UTC")
             print(f"\n📌 Window: {ws.strftime('%H:%M:%S')} → {we.strftime('%H:%M:%S')} UTC")
 
-            # Beat price
-            beat_price = None
-            async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
-                try:
-                    async with sess.get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={(wts-60)*1000}&limit=1", timeout=5) as resp:
-                        if resp.status == 200:
-                            beat_price = float((await resp.json())[0][4])
-                except: pass
+            # Beat price (open price just before window)
+            beat_price = await get_beat_price(wts)
             if not beat_price:
-                async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
-                    resp = await sess.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-                    if resp.status == 200: beat_price = float((await resp.json())["price"])
-            if not beat_price:
-                print("No beat price, skipping")
-                await asyncio.sleep(10)
+                print("❌ Could not get BTC beat price, skipping window")
+                await asyncio.sleep(5)
                 continue
             market_data.update_beat(beat_price)
+            print(f"💰 Beat price: ${beat_price:.2f}")
 
+            # Set up fill events per account
             fill_events = {label: {"up": asyncio.Event(), "down": asyncio.Event()} for label in accounts}
             stop_event = asyncio.Event()
             monitor_task = asyncio.create_task(market_monitor(token_up, token_down, beat_price, stop_event, fill_events))
 
+            # Run until 2 seconds before window end
             while time.time() < we.timestamp() - 2:
                 await asyncio.sleep(0.5)
 
+            # Collect fill statuses
             fill_status = {label: (evts["up"].is_set(), evts["down"].is_set()) for label, evts in fill_events.items()}
             stop_event.set()
             try:
@@ -516,32 +560,42 @@ async def main():
             except asyncio.TimeoutError:
                 monitor_task.cancel()
 
+            # Wait until window end to get settlement
             while time.time() < we.timestamp():
                 await asyncio.sleep(1)
 
-            # Settlement price
+            # Settlement price (close of the 5-min candle)
             settlement_price = None
             async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
                 try:
-                    async with sess.get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={wts*1000+300000}&limit=1", timeout=5) as resp:
+                    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={wts*1000+300000}&limit=1"
+                    async with sess.get(url, timeout=5) as resp:
                         if resp.status == 200:
-                            settlement_price = float((await resp.json())[0][4])
-                except: pass
+                            candle = (await resp.json())
+                            if candle:
+                                settlement_price = float(candle[0][4])   # close
+                except:
+                    pass
             if not settlement_price:
-                settlement_price = beat_price
-            actual = "UP" if settlement_price >= beat_price else "DOWN"
-            print(f"Settlement: {actual} (settle ${settlement_price:.2f})")
+                # fallback to current price
+                settlement_price = await get_btc_price() or beat_price
 
+            actual = "UP" if settlement_price >= beat_price else "DOWN"
+            print(f"🏁 Settlement: {actual} (settle ${settlement_price:.2f})")
+
+            # Update accounts
             for label, limit in zip(accounts.keys(), LIMIT_PRICES):
                 filled_up, filled_down = fill_status[label]
                 cost_up = SHARES_PER_SIDE * limit if filled_up else 0.0
                 cost_down = SHARES_PER_SIDE * limit if filled_down else 0.0
                 total_cost = cost_up + cost_down
                 sides_filled = (1 if filled_up else 0) + (1 if filled_down else 0)
+
                 payout_up = SHARES_PER_SIDE if (actual == "UP" and filled_up) else 0.0
                 payout_down = SHARES_PER_SIDE if (actual == "DOWN" and filled_down) else 0.0
                 pnl = (payout_up + payout_down) - total_cost
                 win = pnl > 0
+
                 accounts[label].update(pnl, sides_filled, win)
                 accounts[label].add_trade(ws, {
                     "up_filled": "YES" if filled_up else "NO",
@@ -550,6 +604,8 @@ async def main():
                     "outcome": "WIN" if win else "LOSS",
                     "pnl": f"${pnl:.2f}"
                 })
+                print(f"  {label}: {'UP='+str(filled_up)+' DOWN='+str(filled_down)} P&L ${pnl:.2f} | Bal ${accounts[label].balance:.2f}")
+
             loop_status["last_error"] = None
             await asyncio.sleep(2)
 
