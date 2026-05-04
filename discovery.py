@@ -2,11 +2,20 @@
 """
 Multi‑Limit Bot – 6 limits (0.45 … 0.20) + real‑time ticker + separate BTC updater.
 Backend polls order book every 200 ms, dashboard updates every 200 ms, BTC every 1s.
+
+Render‑ready: fixed ThreadingHTTPServer import, added proper threading mix‑in.
 """
-import os, sys, time, json, math, asyncio, threading, requests
+import os
+import sys
+import time
+import json
+import math
+import asyncio
+import threading
+import socketserver          # ★ new import for ThreadingMixIn
+import requests
 from datetime import datetime, timezone, timedelta
-from http.server import BaseHTTPRequestHandler
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer   # ★ removed ThreadingHTTPServer
 import aiohttp
 
 # -------------------------------------------------------------------
@@ -17,7 +26,7 @@ SHARES_PER_SIDE = 5
 
 LIMIT_PRICES = [0.45, 0.40, 0.35, 0.30, 0.25, 0.20]
 
-WEB_PORT = int(os.environ.get("PORT", 10000))
+WEB_PORT = int(os.environ.get("PORT", 10003))
 SCAN_INTERVAL = 0.2               # poll order book 5 times per second
 
 # -------------------------------------------------------------------
@@ -35,7 +44,8 @@ def get_bid_ask_single(token_id):
             asks = data.get("asks", [])
             return (float(bids[0]["price"]) if bids else None,
                     float(asks[0]["price"]) if asks else None)
-    except: pass
+    except:
+        pass
     return None, None
 
 def get_bid_ask(up_token, down_token):
@@ -53,7 +63,8 @@ def get_bid_ask(up_token, down_token):
             up_ask = float(data[up_token]["SELL"]) if data.get(up_token, {}).get("SELL") else None
             down_bid = float(data[down_token]["BUY"]) if data.get(down_token, {}).get("BUY") else None
             down_ask = float(data[down_token]["SELL"]) if data.get(down_token, {}).get("SELL") else None
-    except: pass
+    except:
+        pass
     if up_bid is None or up_ask is None:
         ub, ua = get_bid_ask_single(up_token)
         up_bid = up_bid or ub
@@ -78,10 +89,12 @@ async def get_token_ids(slug):
                 if resp.status == 200:
                     data = await resp.json()
                     raw = data.get("clobTokenIds")
-                    if isinstance(raw, str): raw = json.loads(raw)
+                    if isinstance(raw, str):
+                        raw = json.loads(raw)
                     if raw and len(raw) >= 2:
                         return raw[0], raw[1]
-        except: pass
+        except:
+            pass
     return None, None
 
 # -------------------------------------------------------------------
@@ -212,8 +225,13 @@ async def market_monitor(up_token, down_token, beat_price, stop_event, fill_even
         await asyncio.sleep(SCAN_INTERVAL)
 
 # -------------------------------------------------------------------
-# WEB DASHBOARD
+# WEB DASHBOARD (ThreadingMixIn so multiple clients can connect)
 # -------------------------------------------------------------------
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads."""
+    daemon_threads = True          # threads die when main thread exits
+    allow_reuse_address = True
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
@@ -229,6 +247,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def _serve_html(self):
+        # (unchanged HTML block – kept for completeness)
         panels_html = ""
         for label in accounts.keys():
             clean_id = label.replace('$','').replace('.','')
@@ -435,7 +454,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
 def run_web_server():
-    server = ThreadingHTTPServer(('0.0.0.0', WEB_PORT), DashboardHandler)
+    server = ThreadedHTTPServer(('0.0.0.0', WEB_PORT), DashboardHandler)
     print(f"🌐 Dashboard at http://localhost:{WEB_PORT}")
     server.serve_forever()
 
@@ -477,11 +496,13 @@ async def main():
                     async with sess.get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={(wts-60)*1000}&limit=1", timeout=5) as resp:
                         if resp.status == 200:
                             beat_price = float((await resp.json())[0][4])
-                except: pass
+                except:
+                    pass
             if not beat_price:
                 async with aiohttp.ClientSession(headers=PUBLIC_HEADERS) as sess:
                     resp = await sess.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-                    if resp.status == 200: beat_price = float((await resp.json())["price"])
+                    if resp.status == 200:
+                        beat_price = float((await resp.json())["price"])
             if not beat_price:
                 print("Could not fetch beat price, skipping")
                 await asyncio.sleep(10)
@@ -521,7 +542,8 @@ async def main():
                     async with sess.get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={wts*1000+300000}&limit=1", timeout=5) as resp:
                         if resp.status == 200:
                             settlement_price = float((await resp.json())[0][4])
-                except: pass
+                except:
+                    pass
             if not settlement_price:
                 settlement_price = beat_price
             actual = "UP" if settlement_price >= beat_price else "DOWN"
